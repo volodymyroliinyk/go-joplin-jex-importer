@@ -2,7 +2,6 @@ package main
 
 import (
     "archive/tar"
-    "bufio"
     "compress/gzip"
     "encoding/json"
     "errors"
@@ -10,6 +9,7 @@ import (
     "fmt"
     "io"
     "io/fs"
+    multipart "mime/multipart"
     "net"
     "net/http"
     "net/url"
@@ -68,7 +68,7 @@ var (
 
     // Auto-start headless server options
     autoStart = flag.Bool("auto-start", false, "Try to auto-start Joplin CLI server if API is not reachable")
-    profile   = flag.String("profile", filepath.Join(os.Getenv("HOME"), ".config", "joplin-desktop"), "Path to Joplin desktop profile (for CLI server)")
+    profile = flag.String("profile", defaultProfilePath(), "Path to Joplin desktop profile (for CLI server)")
     joplinBin = flag.String("joplin-bin", "joplin", "Path to Joplin CLI binary")
 
     tmpDir       string
@@ -97,6 +97,10 @@ func main() {
     // Ensure API server is available (optionally auto-start)
     if !isApiAlive(baseURL, *apiToken) {
         if *autoStart {
+            if _, err := exec.LookPath(*joplinBin); err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: joplin CLI not found in PATH (%q). Install it or run Desktop with Web Clipper.\n", *joplinBin)
+                os.Exit(1)
+            }
             port := extractPort(baseURL)
             fmt.Printf("• API not reachable, trying to start Joplin CLI server on port %d …\n", port)
             // Persist desired port into profile (so server listens where we expect)
@@ -278,6 +282,19 @@ func main() {
     }
 
     fmt.Println("✔ Done: title-first tags ensured; notes & links established without duplicates.")
+}
+
+func defaultProfilePath() string {
+    if v := os.Getenv("JOPLIN_PROFILE"); strings.TrimSpace(v) != "" {
+        return v
+    }
+    if d, err := os.UserConfigDir(); err == nil && d != "" {
+        return filepath.Join(d, "joplin-desktop") // Win: %AppData%, macOS: ~/Library/..., Linux: ~/.config
+    }
+    if h, err := os.UserHomeDir(); err == nil && h != "" {
+        return filepath.Join(h, ".config", "joplin-desktop")
+    }
+    return "joplin-desktop"
 }
 
 // -------- Type detection --------
@@ -729,55 +746,68 @@ func upsertResource(r Resource) (string, error) {
     if r.FilePath == "" {
         return r.ID, nil
     }
-    // Build multipart body manually: part "data" = file, part "props" = JSON
-    props := map[string]any{"id": r.ID, "title": r.Title}
-    if r.FileExtension != "" {
-        props["file_extension"] = strings.TrimPrefix(r.FileExtension, ".")
-    }
-    propsJSON, _ := json.Marshal(props)
 
-    body := &strings.Builder{}
-    w := multipartWriter(body, r.FilePath, string(propsJSON))
-    mbody, ctype := w.Body(), w.ContentType()
+    pr, pw := io.Pipe()
+    mw := multipart.NewWriter(pw)
 
-    // Try POST first
-    resp, err := apiPOST("/resources", mbody, ctype)
-    if err == nil {
+    go func() {
+        defer pw.Close()
+        // part: data (file)
+        fw, _ := mw.CreateFormFile("data", filepath.Base(r.FilePath))
+        f, _ := os.Open(r.FilePath)
+        defer f.Close()
+        io.Copy(fw, f)
+
+        // part: props (json)
+        props := map[string]any{"id": r.ID, "title": r.Title}
+        if r.FileExtension != "" {
+            props["file_extension"] = strings.TrimPrefix(r.FileExtension, ".")
+        }
+        b, _ := json.Marshal(props)
+        pw2, _ := mw.CreateFormField("props")
+        pw2.Write(b)
+
+        mw.Close()
+    }()
+
+    // POST
+    resp, err := httpClient.Post(apiURL("/resources", nil), mw.FormDataContentType(), pr)
+    if err == nil && resp.StatusCode < 400 {
+        defer resp.Body.Close()
         var out struct {
             ID string `json:"id"`
         }
-        _ = json.Unmarshal(resp, &out)
+        bb, _ := io.ReadAll(resp.Body)
+        _ = json.Unmarshal(bb, &out)
         if out.ID != "" {
             return out.ID, nil
         }
         return r.ID, nil
     }
-    // PUT /resources/:id
-    resp, err = apiPUT("/resources/"+url.PathEscape(r.ID), mbody, ctype)
-    if err == nil {
+    if resp != nil {
+        resp.Body.Close()
+    }
+
+    // PUT як fallback
+    req, _ := http.NewRequest(http.MethodPut, apiURL("/resources/"+url.PathEscape(r.ID), nil), pr)
+    req.Header.Set("Content-Type", mw.FormDataContentType())
+    resp, err = httpClient.Do(req)
+    if err == nil && resp.StatusCode < 400 {
+        defer resp.Body.Close()
         var out struct {
             ID string `json:"id"`
         }
-        _ = json.Unmarshal(resp, &out)
+        bb, _ := io.ReadAll(resp.Body)
+        _ = json.Unmarshal(bb, &out)
         if out.ID == "" {
             out.ID = r.ID
         }
         return out.ID, nil
     }
-    // Last resort: create without explicit id
-    props2 := map[string]any{}
-    propsJSON2, _ := json.Marshal(props2)
-    body2 := &strings.Builder{}
-    w2 := multipartWriter(body2, r.FilePath, string(propsJSON2))
-    if resp2, err2 := apiPOST("/resources", w2.Body(), w2.ContentType()); err2 == nil {
-        var out struct {
-            ID string `json:"id"`
-        }
-        _ = json.Unmarshal(resp2, &out)
-        if out.ID != "" {
-            return out.ID, nil
-        }
+    if resp != nil {
+        resp.Body.Close()
     }
+
     return r.ID, err
 }
 
@@ -887,13 +917,7 @@ func noteHasTag(noteID, tagID string) bool {
 // -------- Small helpers --------
 
 func splitLines(s string) []string {
-    sc := bufio.NewScanner(strings.NewReader(s))
-    // Preserve line endings by appending \n manually
-    var lines []string
-    for sc.Scan() {
-        lines = append(lines, sc.Text()+"\n")
-    }
-    return lines
+    return strings.SplitAfter(s, "\n")
 }
 
 func extractTitleFromBody(body string) string {
