@@ -1,13 +1,13 @@
 # Joplin JEX Importer (Go)
 
-Import Joplin `.jex` exports into **Joplin Desktop** via the Data API — into a chosen notebook — with **idempotent**
+Import Joplin `.jex` exports into **Joplin Desktop** via the Data API - into a chosen notebook - with **idempotent**
 upserts (no duplicates), **resource** handling, and **robust tag linking**.
 
 > Works with modern JEX where item properties are stored at the end of each `.md` file as `key: value` lines.
 
 ## Features
 
-- **Upsert notes by ID**: if a note with the same `id` exists — it’s **updated**, not duplicated.
+- **Upsert notes by ID**: if a note with the same `id` exists - it’s **updated**, not duplicated.
 - **Import resources**: uploads referenced resources and rewrites resource IDs in note bodies if Joplin reassigns them.
 - **Smart tags**:
     - Ensures tags **by title** (searches existing, creates if absent).
